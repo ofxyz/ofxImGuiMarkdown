@@ -1,10 +1,49 @@
 #include "ofxImGuiMarkdown.h"
 #include "ofUtils.h"     // ofLaunchBrowser
 #include "ofGraphics.h"  // ofEnableArbTex, ofDisableArbTex, ofGetUsingArbTex
-#include "ofFileUtils.h" // ofFilePath
+#include "ofFileUtils.h" // ofFilePath, ofFile, ofBufferFromFile
+#include "imgui_internal.h"
 #include <algorithm>     // std::transform
 #include <cctype>        // std::tolower
 #include <cstring>       // strlen
+
+namespace {
+float verticalScrollbarGutterWidth() {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window || (window->Flags & ImGuiWindowFlags_NoScrollbar))
+        return 0.0f;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    if (window->Flags & ImGuiWindowFlags_AlwaysVerticalScrollbar)
+        return style.ScrollbarSize;
+    if (window->ScrollMax.y > 0.0f)
+        return style.ScrollbarSize;
+    return 0.0f;
+}
+
+void blockVerticalGap(float lineMultiple) {
+    const float gap = ImGui::GetTextLineHeight() * lineMultiple;
+    if (gap > 0.0f)
+        ImGui::Dummy(ImVec2(1.0f, gap));
+}
+
+// Filled disc bullet — no ImFont glyph queries (ImGui font APIs vary by version).
+void drawUnorderedListBullet(float& outMarkerW) {
+    const float spacing  = ImGui::GetStyle().ItemSpacing.x;
+    const float lineH    = ImGui::GetTextLineHeight();
+    const float fontSize = ImGui::GetFontSize();
+    const float r        = fontSize * 0.125f;
+    const float pad      = fontSize * 0.15f;
+    const ImVec2 pos     = ImGui::GetCursorScreenPos();
+
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ImVec2(pos.x + pad + r, pos.y + lineH * 0.5f),
+        r,
+        ImGui::GetColorU32(ImGuiCol_Text));
+
+    outMarkerW = pad + r * 2.0f + spacing * 2.0f;
+    ImGui::Indent(outMarkerW);
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // ofxMarkdownRenderer
@@ -20,15 +59,144 @@ void ofxMarkdownRenderer::render(const char* str, const char* str_end) {
     m_tableId = 0;
     m_codeBlockIndex = 0;
     m_listIndentStack.clear();
+    m_pendingSpaceAfterInline = false;
+    m_renderInlineAfter       = false;
+
+    if (regularFont)
+        ImGui::PushFont(regularFont);
+
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    const bool clipToViewport = window && window->WorkRect.GetWidth() > 1.0f;
+    if (clipToViewport) {
+        ImVec2 clipMin = window->WorkRect.Min;
+        ImVec2 clipMax = { layoutRightEdgeX(), window->WorkRect.Max.y };
+        ImGui::PushClipRect(clipMin, clipMax, true);
+    }
+
+    if (contentPadding.x > 0.0f)
+        ImGui::Indent(contentPadding.x);
+
     print(str, str_end);
+
+    if (m_renderInlineAfter) {
+        ImGui::NewLine();
+        m_renderInlineAfter = false;
+    }
+    ImGui::Dummy(ImVec2(1.0f, 1.0f));
+
+    if (contentPadding.x > 0.0f)
+        ImGui::Unindent(contentPadding.x);
+
+    if (clipToViewport)
+        ImGui::PopClipRect();
+
+    if (regularFont)
+        ImGui::PopFont();
+}
+
+float ofxMarkdownRenderer::layoutRightEdgeX() const {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window)
+        return ImGui::GetCursorScreenPos().x + std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+
+    // Use the tighter of layout and draw clip rects, then reserve the scrollbar
+    // overlay (ImGui draws the scrollbar on top of the inner rect, not beside it).
+    float edge = window->InnerClipRect.Max.x;
+    if (window->WorkRect.GetWidth() > 1.0f)
+        edge = std::min(edge, window->WorkRect.Max.x);
+    edge -= contentPadding.y;
+    edge -= verticalScrollbarGutterWidth();
+    return edge;
+}
+
+float ofxMarkdownRenderer::wrapWidth() const {
+    if (m_tableActive)
+        return std::max(ImGui::GetContentRegionAvail().x - contentPadding.y, 1.0f);
+
+    return std::max(layoutRightEdgeX() - ImGui::GetCursorScreenPos().x, 1.0f);
+}
+
+void ofxMarkdownRenderer::finishInlineLayout() {
+    // Clear inline continuation only — block handlers call NewLine() themselves.
+    // Calling NewLine() here stacked with heading scale and caused huge gaps.
+    m_renderInlineAfter = false;
+}
+
+void ofxMarkdownRenderer::SPAN_A(const MD_SPAN_A_DETAIL* d, bool e) {
+    imgui_md::SPAN_A(d, e);
+    if (!e && !m_is_image) {
+        m_pendingSpaceAfterInline = true;
+        m_renderInlineAfter       = true;
+    }
+}
+
+void ofxMarkdownRenderer::SPAN_IMG(const MD_SPAN_IMG_DETAIL* d, bool e) {
+    if (e) {
+        finishInlineLayout();
+        blockVerticalGap(verticalBlockGapLines);
+    }
+    imgui_md::SPAN_IMG(d, e);
+    if (!e)
+        blockVerticalGap(verticalBlockGapLines);
+}
+
+void ofxMarkdownRenderer::SPAN_WIKILINK(const MD_SPAN_WIKILINK_DETAIL* d, bool e) {
+    imgui_md::SPAN_WIKILINK(d, e);
+    if (!e && !m_is_image) {
+        m_pendingSpaceAfterInline = true;
+        m_renderInlineAfter       = true;
+    }
+}
+
+void ofxMarkdownRenderer::SPAN_EM(bool e) {
+    if (italicFont || boldItalicFont) {
+        ImFont* f = (m_is_strong && boldItalicFont) ? boldItalicFont : italicFont;
+        m_is_em = e;
+        if (f) {
+            if (e) {
+                if (m_renderInlineAfter) {
+                    ImGui::SameLine(0.0f, 0.0f);
+                    m_renderInlineAfter = false;
+                }
+                ImGui::PushFont(f);
+            } else {
+                ImGui::PopFont();
+            }
+        }
+    } else {
+        imgui_md::SPAN_EM(e);
+    }
+}
+
+void ofxMarkdownRenderer::SPAN_STRONG(bool e) {
+    if (boldFont || boldItalicFont) {
+        ImFont* f = (m_is_em && boldItalicFont) ? boldItalicFont : boldFont;
+        m_is_strong = e;
+        if (f) {
+            if (e) {
+                if (m_renderInlineAfter) {
+                    ImGui::SameLine(0.0f, 0.0f);
+                    m_renderInlineAfter = false;
+                }
+                ImGui::PushFont(f);
+            } else {
+                ImGui::PopFont();
+            }
+        }
+    } else {
+        imgui_md::SPAN_STRONG(e);
+    }
 }
 
 ImFont* ofxMarkdownRenderer::get_font() const {
     if (m_hlevel == 1) return headingFont;
-    if (m_hlevel >= 2) return h2Font ? h2Font : headingFont;
+    if (m_hlevel == 2) return h2Font;
+    if (m_hlevel >= 3 && m_hlevel <= 6)
+        return boldFont ? boldFont : regularFont; // H3–H6 size from headingScale in BLOCK_H
     if (m_is_table_header && boldFont) return boldFont;
+    if (m_is_strong && m_is_em && boldItalicFont) return boldItalicFont;
+    if (m_is_em && italicFont) return italicFont;
     if (m_is_strong && boldFont) return boldFont;
-    if (m_is_em    && italicFont) return italicFont;
     if (m_is_code  && monoFont)  return monoFont; // inline code spans
     return regularFont; // nullptr → ImGui default
 }
@@ -40,10 +208,186 @@ ImVec4 ofxMarkdownRenderer::get_color() const {
     return ImGui::GetStyle().Colors[ImGuiCol_Text];
 }
 
-void ofxMarkdownRenderer::open_url() const {
-    if (!m_href.empty()) {
-        ofLaunchBrowser(m_href);
+namespace
+{
+    bool looksLikeUrl(const std::string& href)
+    {
+        if (href.find("://") != std::string::npos)
+            return true;
+        if (href.size() >= 4 && href.compare(0, 4, "www.") == 0)
+            return true;
+        return false;
     }
+
+    void splitWikiTarget(const std::string& target,
+                         std::string& page,
+                         std::string& anchor)
+    {
+        page   = target;
+        anchor.clear();
+        const size_t hash = page.find('#');
+        if (hash != std::string::npos) {
+            anchor = page.substr(hash + 1);
+            page.resize(hash);
+        }
+    }
+
+    bool isRemoteImageSource(const std::string& href)
+    {
+        return href.find("://") != std::string::npos;
+    }
+
+    bool isSvgPath(const std::string& path)
+    {
+        std::string ext = ofFilePath::getFileExt(path);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == "svg";
+    }
+
+    // Resolve local paths: cwd (bin/), then data folder via ofToDataPath().
+    // URLs are returned unchanged.
+    std::string resolveImagePath(const std::string& href)
+    {
+        if (href.empty() || isRemoteImageSource(href))
+            return href;
+
+        if (ofFile::doesFileExist(href))
+            return href;
+
+        const std::string inData = ofToDataPath(href, true);
+        if (inData != href && ofFile::doesFileExist(inData))
+            return inData;
+
+        const std::string absolute = ofToDataPath(href, false);
+        if (ofFile::doesFileExist(absolute))
+            return absolute;
+
+        return href;
+    }
+
+    bool loadRasterImage(const std::string& path, std::shared_ptr<ofImage>& out)
+    {
+        const bool wasArb = ofGetUsingArbTex();
+        ofDisableArbTex();
+
+        auto img = std::make_shared<ofImage>();
+        const bool ok = img->load(path);
+
+        if (wasArb)
+            ofEnableArbTex();
+
+        if (ok && img->getTexture().isAllocated()) {
+            out = std::move(img);
+            return true;
+        }
+        return false;
+    }
+
+    bool loadSvgImage(const std::string& path,
+                      std::shared_ptr<ofFbo>& out,
+                      float svgScale)
+    {
+        auto svgDoc = std::make_shared<ofxSvg>();
+        if (!svgDoc->load(path))
+            return false;
+
+        float svgW = svgDoc->getWidth();
+        float svgH = svgDoc->getHeight();
+        if (svgW < 1.0f) svgW = 256.0f;
+        if (svgH < 1.0f) svgH = 256.0f;
+
+        auto fbo = std::make_shared<ofFbo>();
+        ofFboSettings fboSettings;
+        fboSettings.width          = std::round(svgW * svgScale);
+        fboSettings.height         = std::round(svgH * svgScale);
+        fboSettings.internalformat = GL_RGBA;
+        fboSettings.textureTarget  = GL_TEXTURE_2D;
+        fbo->allocate(fboSettings);
+
+        fbo->begin();
+        ofClear(0, 0, 0, 0);
+        ofPushMatrix();
+        ofScale(svgScale, svgScale);
+        svgDoc->draw();
+        ofPopMatrix();
+        fbo->end();
+
+        out = std::move(fbo);
+        return true;
+    }
+}
+
+std::string ofxMarkdownRenderer::resolveWikiPagePath(const std::string& target,
+                                                     std::string* outAnchor) const
+{
+    std::string page;
+    std::string anchor;
+    splitWikiTarget(target, page, anchor);
+
+    if (outAnchor)
+        *outAnchor = anchor;
+
+    if (page.empty() || looksLikeUrl(page))
+        return page;
+
+    std::string path = page;
+    const bool hasSep = page.find('/') != std::string::npos
+                     || page.find('\\') != std::string::npos;
+    if (!wikiLinkBasePath.empty() && !hasSep && !ofFilePath::isAbsolute(page))
+        path = ofFilePath::join(wikiLinkBasePath, page);
+
+    std::string ext = ofFilePath::getFileExt(path);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext.empty()) {
+        if (ofFile::doesFileExist(path + ".md"))
+            path += ".md";
+        else if (ofFile::doesFileExist(path + ".markdown"))
+            path += ".markdown";
+    }
+
+    return path;
+}
+
+void ofxMarkdownRenderer::open_url() const {
+    if (m_href.empty())
+        return;
+
+    if (m_is_wikilink) {
+        if (onWikiLinkClicked) {
+            onWikiLinkClicked(m_href);
+            return;
+        }
+
+        std::string anchor;
+        const std::string pagePath = resolveWikiPagePath(m_href, &anchor);
+
+        if (!pagePath.empty() && looksLikeUrl(pagePath)) {
+            std::string url = pagePath;
+            if (!anchor.empty())
+                url += "#" + anchor;
+            ofLaunchBrowser(url);
+            return;
+        }
+
+        if (pagePath.empty() && !anchor.empty()) {
+            ofLogVerbose("ofxMarkdownRenderer")
+                << "Same-document wiki anchor (set onWikiLinkClicked to handle): #"
+                << anchor;
+            return;
+        }
+
+        if (!pagePath.empty() && ofFile::doesFileExist(pagePath)) {
+            ofLogVerbose("ofxMarkdownRenderer")
+                << "Wiki page exists at " << pagePath
+                << " (set onWikiLinkClicked to load it)";
+            return;
+        }
+
+        ofLogWarning("ofxMarkdownRenderer") << "Wiki page not found: " << m_href;
+        return;
+    }
+
+    ofLaunchBrowser(m_href);
 }
 
 bool ofxMarkdownRenderer::get_image(image_info& nfo) const {
@@ -52,57 +396,20 @@ bool ofxMarkdownRenderer::get_image(image_info& nfo) const {
     auto it = m_imageCache.find(m_href);
     if (it == m_imageCache.end()) {
         CachedImage entry;
+        const std::string path = resolveImagePath(m_href);
+        bool loaded = false;
 
-        // Detect SVG by file extension (case-insensitive).
-        std::string ext = ofFilePath::getFileExt(m_href);
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-        if (ext == "svg") {
-            // Load the SVG document.
-            auto svgDoc = std::make_shared<ofxSvg>();
-            if (svgDoc->load(m_href)) {
-                float svgW = svgDoc->getWidth();
-                float svgH = svgDoc->getHeight();
-                if (svgW < 1.0f) svgW = 256.0f; // fallback for SVGs without explicit size
-                if (svgH < 1.0f) svgH = 256.0f;
-
-                // Render the SVG into an ofFbo at svgScale× resolution.
-                // ofFbo with GL_TEXTURE_2D gives normalised 0–1 UVs for ImGui.
-                auto fbo = std::make_shared<ofFbo>();
-                ofFboSettings fboSettings;
-                fboSettings.width         = std::round(svgW * svgScale);
-                fboSettings.height        = std::round(svgH * svgScale);
-                fboSettings.internalformat = GL_RGBA;
-                fboSettings.textureTarget  = GL_TEXTURE_2D;
-                fbo->allocate(fboSettings);
-
-                fbo->begin();
-                ofClear(0, 0, 0, 0);
-                ofPushMatrix();
-                ofScale(svgScale, svgScale);
-                svgDoc->draw();
-                ofPopMatrix();
-                fbo->end();
-
-                entry.fbo = fbo;
-            } else {
-                entry.failed = true;
-            }
-
+        if (isSvgPath(path)) {
+            loaded = loadSvgImage(path, entry.fbo, svgScale);
         } else {
-            // Raster image (PNG, JPG, GIF, …).
-            // Temporarily disable ARB so the texture uses normalised 0–1 UVs.
-            const bool wasArb = ofGetUsingArbTex();
-            ofDisableArbTex();
+            // All raster formats that ofImage / FreeImage can read (PNG, JPEG,
+            // GIF, TIFF, BMP, PSD, EXR, HDR, …) plus http(s):// URLs.
+            loaded = loadRasterImage(path, entry.raster);
+        }
 
-            auto img = std::make_shared<ofImage>();
-            if (img->load(m_href)) {
-                entry.raster = img;
-            } else {
-                entry.failed = true;
-            }
-
-            if (wasArb) ofEnableArbTex();
+        if (!loaded) {
+            entry.failed = true;
+            ofLogVerbose("ofxMarkdownRenderer") << "Image not loaded: " << m_href;
         }
 
         m_imageCache[m_href] = std::move(entry);
@@ -119,8 +426,7 @@ bool ofxMarkdownRenderer::get_image(image_info& nfo) const {
     float h = tex->getHeight() / (it->second.fbo ? svgScale : 1.0f);
 
     // Scale down to the display limit, preserving aspect ratio.
-    const float limit = (maxImageWidth > 0.0f) ? maxImageWidth
-                      : ImGui::GetContentRegionAvail().x;
+    const float limit = (maxImageWidth > 0.0f) ? maxImageWidth : wrapWidth();
     if (w > limit) {
         h = h * (limit / w);
         w = limit;
@@ -140,35 +446,121 @@ void ofxMarkdownRenderer::clearImageCache() {
 }
 
 void ofxMarkdownRenderer::soft_break() {
-    // Intentionally empty: soft breaks keep inline content on the same line.
-    // Override with ImGui::NewLine() if hard-wrap-on-source-newline is desired.
+    // Markdown soft line break — stay inline (like a space), do not NewLine().
+    m_renderInlineAfter = true;
+}
+
+int ofxMarkdownRenderer::text(MD_TEXTTYPE type, const char* str, const char* str_end) {
+    switch (type) {
+    case MD_TEXT_NORMAL:
+        render_text(str, str_end);
+        break;
+    case MD_TEXT_CODE:
+        render_text(str, str_end);
+        break;
+    case MD_TEXT_NULLCHAR:
+        break;
+    case MD_TEXT_BR:
+        // Single source newlines inside a paragraph are soft breaks in CommonMark.
+        // Treat them as inline continuation so "link\nand" stays on one flow.
+        if (!m_inCodeBlock && m_hlevel == 0 && m_list_stack.empty())
+            soft_break();
+        else
+            ImGui::NewLine();
+        break;
+    case MD_TEXT_SOFTBR:
+        soft_break();
+        break;
+    case MD_TEXT_ENTITY:
+        if (!render_entity(str, str_end))
+            render_text(str, str_end);
+        break;
+    case MD_TEXT_HTML:
+        if (!check_html(str, str_end))
+            render_text(str, str_end);
+        break;
+    case MD_TEXT_LATEXMATH:
+        render_text(str, str_end);
+        break;
+    default:
+        break;
+    }
+
+    if (m_is_table_header) {
+        const float x = ImGui::GetCursorPosX();
+        if (x > m_table_last_pos.x)
+            m_table_last_pos.x = x;
+    }
+
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Headings — synthetic font scaling when custom heading fonts are not loaded
 // ---------------------------------------------------------------------------
 
+void ofxMarkdownRenderer::BLOCK_P(bool e) {
+    if (!e)
+        return;
+    if (!m_list_stack.empty())
+        return;
+    finishInlineLayout();
+    ImGui::Spacing();
+}
+
+void ofxMarkdownRenderer::BLOCK_UL(const MD_BLOCK_UL_DETAIL* d, bool e) {
+    if (e) {
+        m_list_stack.push_back(list_info{ 0, d->mark, false });
+    } else if (!m_list_stack.empty()) {
+        m_list_stack.pop_back();
+    }
+}
+
+void ofxMarkdownRenderer::BLOCK_OL(const MD_BLOCK_OL_DETAIL* d, bool e) {
+    if (e) {
+        m_list_stack.push_back(list_info{ d->start, d->mark_delimiter, true });
+    } else if (!m_list_stack.empty()) {
+        m_list_stack.pop_back();
+    }
+}
+
+void ofxMarkdownRenderer::BLOCK_HR(bool e) {
+    if (e)
+        return;
+    finishInlineLayout();
+    blockVerticalGap(verticalBlockGapLines * 0.9f);
+    ImGui::Separator();
+    blockVerticalGap(verticalBlockGapLines * 0.9f);
+}
+
 void ofxMarkdownRenderer::BLOCK_H(const MD_BLOCK_H_DETAIL* d, bool e) {
     const unsigned lv = std::min(d->level, 6u);
 
-    // Decide whether to use window-font scaling for this heading level.
-    // We scale when there is no custom font that get_font() would return.
-    ImFont* customFont = (lv == 1) ? headingFont
-                       : (lv == 2) ? (h2Font ? h2Font : headingFont)
-                       : nullptr;
+    ImFont* levelFont = (lv == 1) ? headingFont
+                      : (lv == 2) ? h2Font
+                      : nullptr;
     const float scale = headingScale[lv];
-    const bool  doScale = !customFont && scale > 1.001f;
+    const bool  doScale = !levelFont && scale > 1.001f;
 
     if (e) {
+        finishInlineLayout();
+        if (ImGui::GetCursorPosY() > ImGui::GetWindowContentRegionMin().y + 0.5f)
+            blockVerticalGap(verticalBlockGapLines);
+        m_hlevel          = lv;
         m_activeHeadScale = doScale ? scale : 1.0f;
-        if (doScale) ImGui::SetWindowFontScale(scale);
-    }
-
-    imgui_md::BLOCK_H(d, e); // sets m_hlevel, calls set_font(), draws separator
-
-    if (!e) {
-        if (m_activeHeadScale > 1.001f) ImGui::SetWindowFontScale(1.0f);
+        set_font(true);
+        if (doScale)
+            ImGui::SetWindowFontScale(scale);
+    } else {
+        set_font(false);
+        if (m_activeHeadScale > 1.001f)
+            ImGui::SetWindowFontScale(1.0f);
         m_activeHeadScale = 1.0f;
+        m_hlevel          = 0;
+        if (lv <= 2) {
+            ImGui::Spacing();
+            ImGui::Separator();
+        }
     }
 }
 
@@ -207,6 +599,8 @@ ofxMarkdownRenderer::languageFromFence(const std::string& lang) {
         return TextEditor::LanguageDefinitionId::Glsl;
     if (s == "hlsl")
         return TextEditor::LanguageDefinitionId::Hlsl;
+    if (s == "md" || s == "markdown")
+        return TextEditor::LanguageDefinitionId::Markdown;
     return TextEditor::LanguageDefinitionId::None;
 }
 
@@ -229,13 +623,13 @@ void ofxMarkdownRenderer::flushCodeBlock() {
         cache.editor->SetReadOnlyEnabled(true);
         cache.editor->SetShowWhitespacesEnabled(false);
         cache.editor->SetShowLineNumbersEnabled(true);
+        cache.editor->SetSoftWrapEnabled(false);
     }
 
-    // Strip a single trailing newline that MD4C always appends to code blocks
-    // but that TextEditor would show as a spurious empty last line.
+    // Strip trailing newlines MD4C appends to fenced blocks (avoid empty lines).
     std::string text = m_pendingCodeText;
-    if (!text.empty() && text.back() == '\n') text.pop_back();
-    if (!text.empty() && text.back() == '\r') text.pop_back();
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+        text.pop_back();
 
     const TextEditor::LanguageDefinitionId language = languageFromFence(m_codeLanguage);
     if (cache.text != text) {
@@ -247,18 +641,21 @@ void ofxMarkdownRenderer::flushCodeBlock() {
         cache.editor->SetLanguageDefinition(cache.language);
     }
 
-    int lineCount = 1;
-    for (char c : text)
-        if (c == '\n') ++lineCount;
+    ImFont* codeFont = monoFont ? monoFont : regularFont;
+    if (codeFont)
+        ImGui::PushFont(codeFont);
 
-    const float lineH = ImGui::GetTextLineHeightWithSpacing();
-    const float height = std::min(codeBlockMaxHeight,
-                                  std::max(lineH * 3.0f, lineH * lineCount + 12.0f));
+    const int lineCount = cache.editor->GetLineCount();
+    const float lineH = ImGui::GetTextLineHeightWithSpacing() * cache.editor->GetLineSpacing();
+    const float pad   = ImGui::GetStyle().FramePadding.y * 2.0f + 2.0f;
+    const float height = std::min(codeBlockMaxHeight, lineH * lineCount + pad);
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, codeBlockBg);
     char id[32];
     snprintf(id, sizeof(id), "##mdcode%d", index);
-    cache.editor->Render(id, false, ImVec2(ImGui::GetContentRegionAvail().x, height), true);
+    cache.editor->Render(id, false, ImVec2(wrapWidth(), height), false);
+    if (codeFont)
+        ImGui::PopFont();
     ImGui::PopStyleColor();
 }
 
@@ -266,6 +663,7 @@ void ofxMarkdownRenderer::BLOCK_CODE(const MD_BLOCK_CODE_DETAIL* d, bool e) {
     imgui_md::BLOCK_CODE(d, e); // sets m_is_code / m_is_table_body flags in base
 
     if (e) {
+        finishInlineLayout();
         // Assign this block its stable cache index (incremented per render() frame).
         m_activeCodeBlock = m_codeBlockIndex++;
         m_pendingCodeText.clear();
@@ -280,7 +678,6 @@ void ofxMarkdownRenderer::BLOCK_CODE(const MD_BLOCK_CODE_DETAIL* d, bool e) {
         if (firstSpace != std::string::npos)
             m_codeLanguage.resize(firstSpace);
 
-        ImGui::NewLine();
         ImGui::Spacing();
         ImGui::Indent(8.0f);
         if (!useTextEditorForCodeBlocks && monoFont) ImGui::PushFont(monoFont);
@@ -293,7 +690,6 @@ void ofxMarkdownRenderer::BLOCK_CODE(const MD_BLOCK_CODE_DETAIL* d, bool e) {
         if (!useTextEditorForCodeBlocks && monoFont) ImGui::PopFont();
         ImGui::Unindent(8.0f);
         ImGui::Spacing();
-        ImGui::NewLine();
         m_inCodeBlock = false;
         m_codeLanguage.clear();
         m_pendingCodeText.clear();
@@ -306,7 +702,8 @@ void ofxMarkdownRenderer::BLOCK_CODE(const MD_BLOCK_CODE_DETAIL* d, bool e) {
 
 void ofxMarkdownRenderer::BLOCK_QUOTE(bool e) {
     if (e) {
-        ImGui::NewLine();
+        finishInlineLayout();
+        ImGui::Spacing();
         // Record top of the quote for the left bar (drawn on leave).
         m_quoteBarStart   = ImGui::GetCursorScreenPos();
         m_quoteBarStart.x -= 4.0f;
@@ -324,7 +721,7 @@ void ofxMarkdownRenderer::BLOCK_QUOTE(bool e) {
             ImGui::ColorConvertFloat4ToU32(quoteBarColor));
 
         ImGui::Unindent(16.0f);
-        ImGui::NewLine();
+        ImGui::Spacing();
     }
 }
 
@@ -349,9 +746,10 @@ void ofxMarkdownRenderer::BLOCK_LI(const MD_BLOCK_LI_DETAIL* d, bool e) {
     const float spacing = ImGui::GetStyle().ItemSpacing.x;
 
     if (e) {
+        // ImGui already advances to the next line for each widget without
+        // SameLine(); an extra NewLine() here doubled the gap between items.
         if (listItemSpacing > 0.0f)
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + listItemSpacing);
-        ImGui::NewLine();
 
         list_info& nfo = m_list_stack.back();
         float markerY   = ImGui::GetCursorPosY();
@@ -365,18 +763,10 @@ void ofxMarkdownRenderer::BLOCK_LI(const MD_BLOCK_LI_DETAIL* d, bool e) {
             ImGui::Indent(markerW);
             m_listIndentStack.push_back(markerW);
         } else {
-            // Use a bullet character for '*', otherwise the raw delimiter.
-            // Render as TextUnformatted (not ImGui::Bullet()) so we can
-            // measure the width and use the same Indent+SetCursorPosY pattern
-            // as ordered lists — Bullet() leaves an implicit SameLine that
-            // Indent() would cancel, reproducing the same visual artifact.
-            // Use ASCII characters only — the default ImGui fonts do not
-            // include the Unicode bullet (U+2022) so it would show as '?'.
-            char ulMarker[4] = {};
-            ulMarker[0] = (nfo.delim == '*') ? '*' : (char)nfo.delim;
-            ImGui::TextUnformatted(ulMarker);
-            float markerW = ImGui::CalcTextSize(ulMarker).x + spacing * 2.0f;
-            ImGui::Indent(markerW);
+            // Draw a bullet disc (ImDrawList) — works with any font; avoids
+            // ImGui::Bullet() SameLine/Indent interaction and '?' for U+2022.
+            float markerW = 0.0f;
+            drawUnorderedListBullet(markerW);
             m_listIndentStack.push_back(markerW);
         }
 
@@ -389,9 +779,6 @@ void ofxMarkdownRenderer::BLOCK_LI(const MD_BLOCK_LI_DETAIL* d, bool e) {
             ImGui::Unindent(m_listIndentStack.back());
             m_listIndentStack.pop_back();
         }
-        // If we've closed the outermost list, add a blank line.
-        if (m_list_stack.size() == 1)
-            ImGui::NewLine();
     }
 }
 
@@ -410,6 +797,7 @@ void ofxMarkdownRenderer::BLOCK_LI(const MD_BLOCK_LI_DETAIL* d, bool e) {
 
 void ofxMarkdownRenderer::BLOCK_TABLE(const MD_BLOCK_TABLE_DETAIL* d, bool e) {
     if (e) {
+        finishInlineLayout();
         m_tableColCount = static_cast<int>(d->col_count);
         m_tableActive   = false;
         m_tableSkipping = false;
@@ -425,15 +813,16 @@ void ofxMarkdownRenderer::BLOCK_TABLE(const MD_BLOCK_TABLE_DETAIL* d, bool e) {
         char id[32];
         snprintf(id, sizeof(id), "##mdt%d", m_tableId++);
 
-        // BeginTable returns false when the table is clipped (e.g. scrolled
-        // fully out of view).  ALL subsequent table calls must be guarded by
-        // m_tableActive — calling EndTable / TableNextRow on a false-begin is UB.
-        m_tableActive = ImGui::BeginTable(id, m_tableColCount, tableFlags);
+        // Pin table width to the visible column so wide tables do not widen the
+        // scroll canvas and break wrapping for text above.
+        const float tableWidth = wrapWidth();
+        m_tableActive = ImGui::BeginTable(id, m_tableColCount, tableFlags,
+                                          ImVec2(tableWidth, 0.0f));
         m_tableSkipping = !m_tableActive;
-        if (m_tableActive) {
-            for (int i = 0; i < m_tableColCount; ++i)
-                ImGui::TableSetupColumn("");
-        }
+        if (!m_tableActive)
+            return;
+        for (int i = 0; i < m_tableColCount; ++i)
+            ImGui::TableSetupColumn("");
     } else {
         if (m_tableActive) {
             ImGui::EndTable();
@@ -532,8 +921,61 @@ static bool is_explicit_line_break(char c) {
     return c == '\n' || c == '\r';
 }
 
+static bool skip_soft_line_break(const char*& str, const char* str_end) {
+    if (str >= str_end || !is_explicit_line_break(*str))
+        return false;
+    if (*str == '\r' && str + 1 < str_end && *(str + 1) == '\n')
+        str += 2;
+    else
+        ++str;
+    return true;
+}
+
+// When breaking at a whitespace separator, include that character in the
+// rendered chunk so it is not dropped by later skip logic.
+static const char* advance_break_past_separator(const char* lastBreak) {
+    if (lastBreak && is_wrap_space(*lastBreak))
+        return lastBreak + 1;
+    return lastBreak;
+}
+
+// After rendering [str, te), emit any separator spaces before the next chunk.
+static void consume_in_run_separator_spaces(const char*& str, const char* str_end) {
+    while (str < str_end && is_wrap_space(*str)) {
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::TextUnformatted(str, str + 1);
+        ++str;
+    }
+}
+
+static float markdownWrapWidth(const ofxMarkdownRenderer* renderer) {
+    return renderer ? renderer->wrapWidth() : std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+}
+
+static const char* clampToRemainingWidth(ImFont* font,
+                                          float fontSize,
+                                          const char* str,
+                                          const char* str_end,
+                                          const char* te,
+                                          float maxWidth) {
+    if (te <= str || maxWidth <= 1.0f)
+        return te;
+    if (font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, str, te).x <= maxWidth)
+        return te;
+
+    const char* best = str;
+    for (const char* p = str; p < te; ) {
+        const char* next = utf8_advance(p, te);
+        if (font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, str, next).x > maxWidth)
+            break;
+        best = next;
+        p = next;
+    }
+    return (best > str) ? best : utf8_advance(str, str_end);
+}
+
 static const char* find_word_wrap_position(ImFont* font,
-                                            float scale,
+                                            float fontSize,
                                             const char* str,
                                             const char* str_end,
                                             float wrap_width,
@@ -558,10 +1000,10 @@ static const char* find_word_wrap_position(ImFont* font,
                 return p;
 
             const char* next = utf8_advance(p, str_end);
-            const float w = font->CalcTextSizeA(scale, FLT_MAX, 0.0f, str, next).x;
+            const float w = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, str, next).x;
 
             if (w > wrap_width)
-                return lastBreak ? lastBreak : str;
+                return advance_break_past_separator(lastBreak ? lastBreak : str);
 
             if (i < breaks.size()) {
                 const ofxLinebreaker::BreakType br = breaks[i];
@@ -591,10 +1033,10 @@ static const char* find_word_wrap_position(ImFont* font,
             return p;
 
         const char* next = utf8_advance(p, str_end);
-        const float w = font->CalcTextSizeA(scale, FLT_MAX, 0.0f, str, next).x;
+        const float w = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, str, next).x;
 
         if (w > wrap_width)
-            return lastBreak ? lastBreak : str;
+            return advance_break_past_separator(lastBreak ? lastBreak : str);
 
         if (is_wrap_space(*p) || *p == '-' || *p == '/')
             lastBreak = p;
@@ -614,7 +1056,27 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
         return;
     }
 
-    const float scale = ImGui::GetIO().FontGlobalScale;
+    if (m_renderInlineAfter) {
+        ImGui::SameLine(0.0f, 0.0f);
+        m_renderInlineAfter = false;
+    }
+
+    if (m_pendingSpaceAfterInline && str < str_end) {
+        m_pendingSpaceAfterInline = false;
+        if (!is_wrap_space(*str) && *str != ')' && *str != '.' && *str != ',' &&
+            *str != ';' && *str != ':' && *str != '!' && *str != '?')
+        {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::TextUnformatted(" ", str + 1);
+        }
+    }
+
+    while (skip_soft_line_break(str, str_end))
+        m_renderInlineAfter = true;
+    if (str >= str_end)
+        return;
+
+    const float fontSize = ImGui::GetFontSize();
     const ImGuiStyle& s = ImGui::GetStyle();
     ImFont* font = ImGui::GetFont();
     bool is_lf = false;
@@ -625,13 +1087,9 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
 
         if (!m_is_table_header) {
 
-            float wl = ImGui::GetContentRegionAvail().x;
+            float wl = markdownWrapWidth(this);
 
-            // (Intentionally do not replicate the m_is_table_body branch —
-            // our table override keeps m_is_table_body false and lets
-            // GetContentRegionAvail() reflect the ImGui Table column width.)
-
-            te = find_word_wrap_position(font, scale, str, str_end, wl, wrapLanguage);
+            te = find_word_wrap_position(font, fontSize, str, str_end, wl, wrapLanguage);
 
             if (te == str) {
                 // ── No break point fits in the remaining line width ──────────
@@ -640,9 +1098,8 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
                 // them immediately; otherwise the hyphenation path sees an
                 // empty word and the input pointer never advances.
                 if (is_explicit_line_break(*str)) {
-                    ImGui::NewLine();
-                    is_lf = true;
-                    ++str;
+                    skip_soft_line_break(str, str_end);
+                    m_renderInlineAfter = true;
                     continue;
                 }
 
@@ -651,8 +1108,8 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
                 // the true column width from that point.
                 ImGui::NewLine();
                 is_lf = true;
-                wl = ImGui::GetContentRegionAvail().x;
-                te = find_word_wrap_position(font, scale, str, str_end, wl, wrapLanguage);
+                wl = markdownWrapWidth(this);
+                te = find_word_wrap_position(font, fontSize, str, str_end, wl, wrapLanguage);
 
                 if (te == str) {
                     // ── Word is wider than the whole column — hyphenate ──────
@@ -660,9 +1117,8 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
                     // Same guard after the fresh-line retry: keep every loop
                     // path consuming at least one byte.
                     if (is_explicit_line_break(*str)) {
-                        ImGui::NewLine();
-                        is_lf = true;
-                        ++str;
+                        skip_soft_line_break(str, str_end);
+                        m_renderInlineAfter = true;
                         continue;
                     }
 
@@ -674,16 +1130,15 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
                         word_end = utf8_advance(word_end, str_end);
 
                     const float hyphen_w = font->CalcTextSizeA(
-                        scale, FLT_MAX, 0.0f, "-").x;
+                        fontSize, FLT_MAX, 0.0f, "-").x;
                     const float budget = wl - hyphen_w;
 
                     const char* frag = str;
                     if (budget > 0.0f) {
-                        // Walk forward until fragment + '-' would exceed budget.
                         while (frag < word_end) {
                             const char* next = utf8_advance(frag, word_end);
                             float w = font->CalcTextSizeA(
-                                scale, FLT_MAX, 0.0f, str, next).x;
+                                fontSize, FLT_MAX, 0.0f, str, next).x;
                             if (w > budget) break;
                             frag = next;
                         }
@@ -703,9 +1158,19 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
                     is_lf = true;
 
                     str = frag;
-                    while (str < str_end && is_wrap_space(*str)) ++str;
+                    consume_in_run_separator_spaces(str, str_end);
                     continue;
                 }
+            }
+
+            // Safety net: find_word_wrap can overshoot when layout width shrinks after
+            // earlier SameLine fragments; never draw past the current remaining width.
+            wl = markdownWrapWidth(this);
+            te = clampToRemainingWidth(font, fontSize, str, str_end, te, wl);
+            if (te == str && str < str_end && !is_explicit_line_break(*str)) {
+                ImGui::NewLine();
+                is_lf = true;
+                continue;
             }
         }
 
@@ -714,7 +1179,7 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
         // itself so the glyph pixels render on top.
         if (m_is_code && !m_inCodeBlock) {
             const ImVec2 p   = ImGui::GetCursorScreenPos();
-            const float  w   = font->CalcTextSizeA(scale, FLT_MAX, 0.0f, str, te).x;
+            const float  w   = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, str, te).x;
             const float  h   = ImGui::GetTextLineHeight();
             const float  pad = 3.0f;
             ImGui::GetWindowDrawList()->AddRectFilled(
@@ -747,10 +1212,15 @@ void ofxMarkdownRenderer::render_text(const char* str, const char* str_end) {
         if (m_is_strikethrough) line(ImColor(s.Colors[ImGuiCol_Text]), false);
 
         str = te;
-        while (str < str_end && is_wrap_space(*str)) ++str;
+        consume_in_run_separator_spaces(str, str_end);
+        if (str < str_end)
+            ImGui::SameLine(0.0f, 0.0f);
     }
 
-    if (!is_lf) ImGui::SameLine(0.0f, 0.0f);
+    if (!is_lf)
+        m_renderInlineAfter = true;
+    else
+        m_renderInlineAfter = false;
 }
 
 // ---------------------------------------------------------------------------

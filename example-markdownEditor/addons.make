@@ -1,4 +1,5 @@
 ofxImGui
+ofxImGuiStyle
 ofxImGuiTextEdit
 ofxImGuiMarkdown
 ofxSvg

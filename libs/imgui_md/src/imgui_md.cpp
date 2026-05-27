@@ -30,7 +30,7 @@ imgui_md::imgui_md()
 {
 	m_md.abi_version = 0;
 
-	m_md.flags = MD_FLAG_TABLES | MD_FLAG_UNDERLINE | MD_FLAG_STRIKETHROUGH;
+	m_md.flags = MD_FLAG_TABLES | MD_FLAG_UNDERLINE | MD_FLAG_STRIKETHROUGH | MD_FLAG_WIKILINKS;
 
 	m_md.enter_block = [](MD_BLOCKTYPE t, void* d, void* u) {
 		return ((imgui_md*)u)->block(t, d, true);
@@ -398,9 +398,11 @@ void imgui_md::SPAN_LATEXMATH_DISPLAY(bool)
 
 }
 
-void imgui_md::SPAN_WIKILINK(const MD_SPAN_WIKILINK_DETAIL*, bool)
+void imgui_md::SPAN_WIKILINK(const MD_SPAN_WIKILINK_DETAIL* d, bool e)
 {
-
+	m_is_wikilink = e;
+	set_href(e, d->target);
+	set_color(e);
 }
 
 void imgui_md::SPAN_U(bool e)

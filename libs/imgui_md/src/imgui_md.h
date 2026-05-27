@@ -129,6 +129,7 @@ protected:
 	bool m_is_strikethrough = false;
 	bool m_is_em = false;
 	bool m_is_strong = false;
+	bool m_is_wikilink = false;
 	bool m_is_table_header = false;
 	bool m_is_table_body = false;
 	bool m_is_image = false;
@@ -146,21 +147,26 @@ protected:
 	};
 	std::vector<list_info> m_list_stack;
 
-private:
+	// Subclasses may override to customize MD_TEXT_BR / entity handling.
+	virtual int text(MD_TEXTTYPE type, const char* str, const char* str_end);
 
-	int text(MD_TEXTTYPE type, const char* str, const char* str_end);
-	int block(MD_BLOCKTYPE type, void* d, bool e);
-	int span(MD_SPANTYPE type, void* d, bool e);
-
-	void set_font(bool e);
-	void set_color(bool e);
-	void set_href(bool e, const MD_ATTRIBUTE& src);
-
-	//table state
+	//table state (protected so subclasses can extend text())
 	int m_table_next_column = 0;
 	ImVec2 m_table_last_pos;
 	std::vector<float> m_table_col_pos;
 	std::vector<float> m_table_row_pos;
+
+private:
+
+	int block(MD_BLOCKTYPE type, void* d, bool e);
+	int span(MD_SPANTYPE type, void* d, bool e);
+
+protected:
+	void set_font(bool e);
+	void set_color(bool e);
+	void set_href(bool e, const MD_ATTRIBUTE& src);
+
+private:
 
 	std::vector<std::string> m_div_stack;
 
