@@ -53,11 +53,10 @@ That is **full variant coverage** for the bundled monospace family. It is **not*
 
 | Addon | Role |
 |-------|------|
-| `ofxImGui` | ImGui integration |
-| `ofxImGuiTextEdit` | Fenced code blocks with language highlighting |
-| `ofxSvg` | SVG image loading |
-| `ofxUnicode` | Optional — Unicode-aware line breaking in preview wrap |
-| `ofxImGuiStyle` | Optional — bundled Input Sans + JetBrains Mono (no disk font files) |
+| [`ofxImGui`](https://github.com/ofxyz/ofxImGui) | ImGui integration |
+| [`ofxImGuiTextEdit`](https://github.com/ofxyz/ofxImGuiTextEdit) | Fenced code blocks with language highlighting |
+| [`ofxUnicode`](https://github.com/ofxyz/ofxUnicode) | Optional — Unicode-aware line breaking in preview wrap |
+| [`ofxImGuiStyle`](https://github.com/ofxyz/ofxImGuiStyle) | Optional — bundled Input Sans + JetBrains Mono (no disk font files) |
 
 ## Usage
 
